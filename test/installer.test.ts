@@ -258,6 +258,26 @@ test("update keeps each install's scope and agents, without a terminal", async (
   assert.deepEqual(m.providers, ["codex"]);
 });
 
+test("update refuses to downgrade unless --force", async () => {
+  const s = sandbox();
+  s.tool.version = "2.0.0";
+  await install(s);
+  s.tool.version = "1.9.0";
+  s.logs.length = 0;
+  assert.equal(await update(s), 1);
+  assert.equal(json(s.project, ".ai-tools/demo-tool.json").version, "2.0.0");
+  assert.match(s.logs.join("\n"), /installed 2\.0\.0 is newer than this copy \(1\.9\.0\)/);
+  assert.equal(await update(s, "--force"), 0);
+  assert.equal(json(s.project, ".ai-tools/demo-tool.json").version, "1.9.0");
+});
+
+test("update rejects --agents", async () => {
+  const s = sandbox();
+  await install(s);
+  await assert.rejects(update(s, "--agents", "codex"), /use install --agents/);
+  assert.deepEqual(json(s.project, ".ai-tools/demo-tool.json").providers, ["claude-code", "codex"]);
+});
+
 test("update with nothing installed fails and writes nothing", async () => {
   const s = sandbox();
   assert.equal(await update(s), 1);

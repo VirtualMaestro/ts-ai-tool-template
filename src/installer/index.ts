@@ -44,7 +44,7 @@ Options:
   --dir <path>       Project root (default: current directory)
   -y, --yes          Do not ask for confirmation
   --dry-run          Print the plan, change nothing
-  --force            Overwrite or remove files changed since install`;
+  --force            Overwrite or remove files changed since install; let update downgrade`;
 
 export async function runInstallerCommand(command: string, argv: string[], tool: ToolInfo, opts: RunOptions = {}): Promise<number> {
   const { values } = parseArgs({
@@ -132,9 +132,17 @@ export async function runInstallerCommand(command: string, argv: string[], tool:
   }
 
   if (command === "update") {
+    if (agentsFlag) throw new Error("update keeps each install's agents; use install --agents to change them");
     const found = (flagScope ? [flagScope] : installedScopes).filter((s) => installedScopes.includes(s));
     if (found.length === 0) {
       log(`${tool.name} is not installed${flagScope ? ` (${flagScope})` : ""}: run install first.`);
+      return 1;
+    }
+    // A cached `npx <tool>` can be older than what is installed; updating from it would downgrade.
+    const newer = found.map((s) => readManifest(rootFor(s), tool.name)!).filter((m) => isNewer(m.version, tool.version));
+    if (newer.length && !values.force) {
+      newer.forEach((m) => log(`${m.scope}: installed ${m.version} is newer than this copy (${tool.version}).`));
+      log(`Run npx ${packageName}@latest update, or --force to downgrade.`);
       return 1;
     }
     for (const s of found) {

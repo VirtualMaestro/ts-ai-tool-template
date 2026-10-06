@@ -22,7 +22,8 @@ older version.
 
 When run without a terminal (CI, an AI agent, Git Bash under MinTTY), it never prompts. Flags decide.
 Without flags `install` uses the project scope and the previous install's agents, or every agent;
-`update` uses the scope and agents each install recorded.
+`update` uses the scope and agents each install recorded (change agents with `install --agents`).
+It refuses to replace an install with an older version unless `--force` is given.
 
 | Option | Meaning |
 |---|---|
@@ -31,7 +32,7 @@ Without flags `install` uses the project scope and the previous install's agents
 | `--dir <path>` | Project root (default: current directory) |
 | `-y`, `--yes` | Skip the confirmation |
 | `--dry-run` | Show the plan, change nothing |
-| `--force` | Overwrite or remove files changed since install |
+| `--force` | Overwrite or remove files changed since install; let `update` downgrade |
 
 ## What the installer guarantees
 
