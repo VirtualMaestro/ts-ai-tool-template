@@ -21,7 +21,7 @@ export type Op = { provider: string } & (
 export type Entry = { provider: string } & (
   | { type: "file"; path: string; sha256: string }
   | { type: "json"; path: string; keyPath: string[]; mode: "set" | "push"; value: unknown }
-  | { type: "block"; path: string; style: BlockStyle }
+  | { type: "block"; path: string; style: BlockStyle; sha256?: string } // older manifests lack sha256: update asks once
   | { type: "exec"; label: string; install: string[]; uninstall: string[] }
 );
 
@@ -42,7 +42,7 @@ export function toEntry(op: Op, root: string): Entry {
   switch (op.type) {
     case "file": return { provider: op.provider, type: "file", path: relTo(root, op.path), sha256: sha256(op.content) };
     case "json": return { ...op, path: relTo(root, op.path) };
-    case "block": return { provider: op.provider, type: "block", path: relTo(root, op.path), style: op.style };
+    case "block": return { provider: op.provider, type: "block", path: relTo(root, op.path), style: op.style, sha256: sha256(op.content.trim()) };
     case "exec": return op;
   }
 }

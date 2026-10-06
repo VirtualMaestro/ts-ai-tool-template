@@ -1,7 +1,7 @@
 import { execFileSync } from "node:child_process";
 import os from "node:os";
 import path from "node:path";
-import { parseArgs } from "node:util";
+import { isDeepStrictEqual, parseArgs } from "node:util";
 import { loadAssets } from "./assets.ts";
 import { readBytes, sha256 } from "./fsx.ts";
 import {
@@ -26,6 +26,8 @@ export type RunOptions = {
   /** Runs an external command such as `claude mcp add-json`; throws on failure. */
   run?: (argv: string[]) => void;
   log?: (line: string) => void;
+  /** Asks yes/no in the terminal. */
+  confirm?: (message: string) => Promise<boolean>;
   /** The latest version on npm, or undefined when it cannot be read. Defaults to the npm registry. */
   latestVersion?: (packageName: string) => Promise<string | undefined>;
 };
@@ -85,7 +87,10 @@ export async function runInstallerCommand(command: string, argv: string[], tool:
   const flushWarnings = () => warnings.splice(0).forEach((w) => log(`! ${w}`));
   const packageName = tool.packageName ?? tool.name;
 
-  const installInto = async (scope: Scope, providers: string[], ask: boolean): Promise<number> => {
+  const ask = opts.confirm ?? confirm;
+
+  /** "always": confirm every change (install). "new-code": only new or changed hooks and MCP servers (update). */
+  const installInto = async (scope: Scope, providers: string[], confirmWhen: "always" | "new-code"): Promise<number> => {
     const root = rootFor(scope);
     const old = readManifest(root, tool.name);
     const assets = loadAssets(tool.assetsDir);
@@ -95,17 +100,23 @@ export async function runInstallerCommand(command: string, argv: string[], tool:
     const fresh = ops.map((op) => toEntry(op, root));
     const freshKeys = new Set(fresh.map(entryKey));
     const stale = (old?.entries ?? []).filter((e) => !freshKeys.has(entryKey(e)));
+    const previous = new Map((old?.entries ?? []).map((e) => [entryKey(e), e]));
+    const newCode = fresh.filter((e) => runsCode(e) && !isDeepStrictEqual(previous.get(entryKey(e)), e));
 
     log(`${old ? "Update" : "Install"} ${tool.name} ${tool.version} (${scope}: ${root})`);
     fresh.forEach((e) => log(`  ${describe(e, "install")}`));
     stale.forEach((e) => log(`  ${describe(e, "remove")}`));
-    if (fresh.some(runsCode)) log("Hooks and MCP servers run commands on this machine.");
+    if (confirmWhen === "always" && fresh.some(runsCode)) log("Hooks and MCP servers run commands on this machine.");
+    if (confirmWhen === "new-code" && newCode.length) {
+      log("New or changed hooks and MCP servers, they run commands on this machine:");
+      newCode.forEach((e) => log(`  ${describe(e, "install")}`));
+    }
     if (values["dry-run"]) return 0;
-    if (ask && !(await confirm("Apply?"))) return 1;
+    const confirmNeeded = confirmWhen === "always" || newCode.length > 0;
+    if (interactive && !values.yes && confirmNeeded && !(await ask("Apply?"))) return 1;
 
     const eng = engine(root);
     for (const e of stale) guard(() => revert(e, eng), warnings);
-    const previous = new Map((old?.entries ?? []).map((e) => [entryKey(e), e]));
     const recorded: Entry[] = [];
     ops.forEach((op, i) => {
       const prev = previous.get(entryKey(fresh[i]));
@@ -146,7 +157,7 @@ export async function runInstallerCommand(command: string, argv: string[], tool:
       return 1;
     }
     for (const s of found) {
-      const code = await installInto(s, readManifest(rootFor(s), tool.name)!.providers, false);
+      const code = await installInto(s, readManifest(rootFor(s), tool.name)!.providers, "new-code");
       if (code !== 0) return code;
     }
     return 0;
@@ -168,7 +179,7 @@ export async function runInstallerCommand(command: string, argv: string[], tool:
     log(`Uninstall ${tool.name} (${scope}: ${root})`);
     gone.forEach((e) => log(`  ${describe(e, "remove")}`));
     if (values["dry-run"]) return 0;
-    if (interactive && !values.yes && !(await confirm("Remove these?"))) return 1;
+    if (interactive && !values.yes && !(await ask("Remove these?"))) return 1;
     const eng = engine(root);
     for (const e of gone) guard(() => revert(e, eng), warnings);
     writeManifest(root, { ...m, providers: m.providers.filter((p) => !remove.includes(p)), entries: kept });
@@ -191,7 +202,7 @@ export async function runInstallerCommand(command: string, argv: string[], tool:
     log("No AI agent selected, nothing to do.");
     return 1;
   }
-  return installInto(scope, providers, interactive && !values.yes);
+  return installInto(scope, providers, "always");
 }
 
 /** Asks the npm registry; offline, private or unpublished reads as "unknown", never as an error. */

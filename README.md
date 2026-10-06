@@ -12,7 +12,7 @@ Create a repository from this template, then follow [AGENTS.md](AGENTS.md).
 npx <tool>@latest install              # menus: where, which AI agents, confirm
 npx <tool>@latest install --global --agents claude-code,codex --yes
 npx <tool>@latest install --dry-run    # print the plan only
-npx <tool>@latest update               # every install, same scope and agents, no questions
+npx <tool>@latest update               # every install, same scope and agents
 npx <tool>@latest status               # installed version, newer one on npm, changed or missing files
 npx <tool>@latest uninstall
 ```
@@ -44,6 +44,8 @@ It refuses to replace an install with an older version unless `--force` is given
   - A file it cannot parse is left alone.
 - **`CLAUDE.md` / `AGENTS.md`.** Its text goes between `<!-- <tool>:start -->` and `<!-- <tool>:end -->` markers.
 - **Code that runs.** It flags hooks and MCP servers in the plan, because they run commands on your machine.
+  `update` asks only when an update adds or changes one of them (in a terminal, without `--yes`);
+  without a terminal it lists them and goes on.
 
 After a project install, Codex reads `.codex/` only once you trust the project. Codex also asks you to review new hooks with `/hooks`.
 

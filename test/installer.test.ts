@@ -271,6 +271,45 @@ test("update refuses to downgrade unless --force", async () => {
   assert.equal(json(s.project, ".ai-tools/demo-tool.json").version, "1.9.0");
 });
 
+test("update asks only when hooks or MCP servers are new or changed", async () => {
+  const assets = copyAssets();
+  const asked: string[] = [];
+  let answer = false;
+  const s = sandbox(assets, { interactive: true, confirm: async (m) => (asked.push(m), answer) });
+  await install(s, "--project", "--agents", "claude-code,codex", "--yes");
+
+  assert.equal(await update(s), 0);
+  assert.deepEqual(asked, [], "nothing changed: no question");
+
+  const hooksFile = path.join(assets, "hooks/hooks.json");
+  fs.writeFileSync(hooksFile, read(hooksFile).replace('"timeout": 10', '"timeout": 20'));
+  s.logs.length = 0;
+  assert.equal(await update(s), 1, "declined");
+  assert.equal(asked.length, 1);
+  assert.match(s.logs.join("\n"), /New or changed hooks[^\n]*\n {2}\+ \.claude\/settings\.json → hooks\.SessionStart\[\]/);
+  assert.equal(json(s.project, ".claude/settings.json").hooks.SessionStart[0].hooks[0].timeout, 10);
+
+  answer = true;
+  assert.equal(await update(s), 0);
+  assert.equal(json(s.project, ".claude/settings.json").hooks.SessionStart[0].hooks[0].timeout, 20);
+  asked.length = 0;
+  assert.equal(await update(s), 0);
+  assert.deepEqual(asked, [], "accepted change is not asked again");
+
+  // A changed MCP server must be noticed in Codex's TOML block too, not only in .mcp.json.
+  const mcpFile = path.join(assets, ".mcp.json");
+  fs.writeFileSync(mcpFile, read(mcpFile).replace('"demo"', '"live"'));
+  await install(s, "--project", "--agents", "codex", "--yes");
+  asked.length = 0;
+  fs.writeFileSync(mcpFile, read(mcpFile).replace('"live"', '"other"'));
+  assert.equal(await update(s, "--yes"), 0);
+  assert.deepEqual(asked, [], "--yes skips the question");
+  fs.writeFileSync(mcpFile, read(mcpFile).replace('"other"', '"again"'));
+  assert.equal(await update(s), 0);
+  assert.equal(asked.length, 1);
+  assert.match(read(s.project, ".codex/config.toml"), /EXAMPLE_MODE = "again"/);
+});
+
 test("update rejects --agents", async () => {
   const s = sandbox();
   await install(s);
