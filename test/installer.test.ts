@@ -20,12 +20,13 @@ function sandbox(assetsDir = EXAMPLES, extra: Partial<RunOptions> = {}): Sandbox
   const ran: string[][] = [];
   const opts: RunOptions = {
     cwd: project, home, env: {}, interactive: false,
-    run: (argv) => void ran.push(argv), log: (l) => void logs.push(l), ...extra,
+    run: (argv) => void ran.push(argv), log: (l) => void logs.push(l), latestVersion: async () => undefined, ...extra,
   };
   return { project, home, tool: { name: "demo-tool", version: "1.0.0", assetsDir }, logs, ran, opts };
 }
 
 const install = (s: Sandbox, ...argv: string[]) => runInstallerCommand("install", argv, s.tool, s.opts);
+const update = (s: Sandbox, ...argv: string[]) => runInstallerCommand("update", argv, s.tool, s.opts);
 const uninstall = (s: Sandbox, ...argv: string[]) => runInstallerCommand("uninstall", argv, s.tool, s.opts);
 const read = (...p: string[]) => fs.readFileSync(path.join(...p), "utf8");
 const json = (...p: string[]) => JSON.parse(read(...p));
@@ -237,6 +238,43 @@ test("status reports version drift and changed files", async () => {
   await runInstallerCommand("status", [], s.tool, s.opts);
   const out = s.logs.join("\n");
   assert.match(out, /project: demo-tool 1\.0\.0 for claude-code, codex/);
-  assert.match(out, /package is 2\.0\.0: run install to update/);
+  assert.match(out, /package is 2\.0\.0: run update/);
   assert.match(out, /changed {2}\.claude\/agents\/example-agent\.md/);
+});
+
+test("update keeps each install's scope and agents, without a terminal", async () => {
+  const assets = copyAssets();
+  const s = sandbox(assets);
+  await install(s, "--global", "--agents", "codex");
+  fs.rmSync(path.join(assets, "skills/example-skill/references"), { recursive: true });
+  s.tool.version = "1.1.0";
+  assert.equal(await update(s), 0);
+  assert.ok(!exists(s.home, ".agents/skills/example-skill/references"));
+  assert.ok(exists(s.home, ".agents/skills/example-skill/SKILL.md"));
+  assert.ok(!exists(s.home, ".claude"));
+  assert.deepEqual(walkFiles(s.project), []);
+  const m = json(s.home, ".ai-tools/demo-tool.json");
+  assert.equal(m.version, "1.1.0");
+  assert.deepEqual(m.providers, ["codex"]);
+});
+
+test("update with nothing installed fails and writes nothing", async () => {
+  const s = sandbox();
+  assert.equal(await update(s), 1);
+  assert.deepEqual(walkFiles(s.project), []);
+  assert.deepEqual(walkFiles(s.home), []);
+});
+
+test("status names a newer npm version, and says nothing when npm is unreachable", async () => {
+  const s = sandbox(EXAMPLES, { latestVersion: async () => "1.2.0" });
+  s.tool.packageName = "@me/demo-tool";
+  await install(s);
+  s.logs.length = 0;
+  await runInstallerCommand("status", [], s.tool, s.opts);
+  assert.match(s.logs.join("\n"), /npm has 1\.2\.0: run npx @me\/demo-tool@latest update/);
+
+  s.opts.latestVersion = async () => undefined;
+  s.logs.length = 0;
+  await runInstallerCommand("status", [], s.tool, s.opts);
+  assert.doesNotMatch(s.logs.join("\n"), /npm has|run update/);
 });

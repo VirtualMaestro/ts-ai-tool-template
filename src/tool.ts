@@ -10,6 +10,7 @@ const pkg = JSON.parse(fs.readFileSync(path.join(packageRoot, "package.json"), "
 
 export const TOOL: ToolInfo = {
   name: pkg.name.replace(/^@[^/]+\//, ""),
+  packageName: pkg.name,
   version: pkg.version,
   assetsDir: path.join(packageRoot, "assets"),
 };

@@ -5,6 +5,7 @@ import { COMMANDS, DESCRIPTION, TOOL } from "./tool.ts";
 const HELP = `${TOOL.name} ${TOOL.version}: ${DESCRIPTION}
 
 Usage: ${TOOL.name} <command> [options]
+Update: npx ${TOOL.packageName}@latest update
 
 Commands:
 ${INSTALLER_HELP}${Object.entries(COMMANDS).map(([name, c]) => `\n  ${name.padEnd(11)} ${c.summary}`).join("")}`;

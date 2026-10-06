@@ -9,15 +9,20 @@ Create a repository from this template, then follow [AGENTS.md](AGENTS.md).
 ## Install a tool built from this template
 
 ```sh
-npx <tool> install                     # menus: where, which AI agents, confirm
-npx <tool> install --global --agents claude-code,codex --yes
-npx <tool> install --dry-run           # print the plan only
-npx <tool> status                      # installed version, changed or missing files
-npx <tool> uninstall
+npx <tool>@latest install              # menus: where, which AI agents, confirm
+npx <tool>@latest install --global --agents claude-code,codex --yes
+npx <tool>@latest install --dry-run    # print the plan only
+npx <tool>@latest update               # every install, same scope and agents, no questions
+npx <tool>@latest status               # installed version, newer one on npm, changed or missing files
+npx <tool>@latest uninstall
 ```
 
+Keep `@latest`: without it `npx` may run a copy it cached earlier, and that copy installs its own,
+older version.
+
 When run without a terminal (CI, an AI agent, Git Bash under MinTTY), it never prompts. Flags decide.
-Without flags it uses the previous install's choice, or the project scope with every agent.
+Without flags `install` uses the project scope and the previous install's agents, or every agent;
+`update` uses the scope and agents each install recorded.
 
 | Option | Meaning |
 |---|---|
@@ -31,7 +36,7 @@ Without flags it uses the previous install's choice, or the project scope with e
 ## What the installer guarantees
 
 - **Manifest.** It records everything it writes in `.ai-tools/<tool>.json`, in the project root or in the home directory.
-- **Update.** Running `install` again updates the tool and removes files the new version no longer ships.
+- **Update.** `update`, or `install` again, brings an install to the running version and removes files the new version no longer ships.
 - **Changed files.** A file you changed after install, or one the tool did not create, is kept. Only `--force` overwrites or removes it.
 - **Shared config files.** In `settings.json`, `hooks.json`, `.mcp.json` and `config.toml` it adds only its own entries. `uninstall` takes exactly those out again.
   - Before it first changes one of these files, it saves a `.bak` copy.

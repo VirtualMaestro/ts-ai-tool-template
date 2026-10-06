@@ -14,7 +14,8 @@ import { PROVIDERS, type Ctx } from "./providers.ts";
 // Self-contained: nothing here imports from outside src/installer/, so a tool made from the
 // template can take installer fixes by copying this folder over its own.
 
-export type ToolInfo = { name: string; version: string; assetsDir: string };
+/** `packageName` is the npm name, scope included; it defaults to `name`. */
+export type ToolInfo = { name: string; version: string; assetsDir: string; packageName?: string };
 
 export type RunOptions = {
   cwd?: string;
@@ -25,11 +26,14 @@ export type RunOptions = {
   /** Runs an external command such as `claude mcp add-json`; throws on failure. */
   run?: (argv: string[]) => void;
   log?: (line: string) => void;
+  /** The latest version on npm, or undefined when it cannot be read. Defaults to the npm registry. */
+  latestVersion?: (packageName: string) => Promise<string | undefined>;
 };
 
-export const INSTALLER_COMMANDS = ["install", "uninstall", "status"];
+export const INSTALLER_COMMANDS = ["install", "update", "uninstall", "status"];
 
 export const INSTALLER_HELP = `  install     Install or update for Claude Code and/or Codex
+  update      Update every install to this version, keeping its scope and agents
   uninstall   Remove everything the install wrote
   status      Show what is installed and whether it is out of date
 
@@ -79,13 +83,63 @@ export async function runInstallerCommand(command: string, argv: string[], tool:
     root, tool: tool.name, force: Boolean(values.force), run, warn: (w) => warnings.push(w),
   });
   const flushWarnings = () => warnings.splice(0).forEach((w) => log(`! ${w}`));
+  const packageName = tool.packageName ?? tool.name;
+
+  const installInto = async (scope: Scope, providers: string[], ask: boolean): Promise<number> => {
+    const root = rootFor(scope);
+    const old = readManifest(root, tool.name);
+    const assets = loadAssets(tool.assetsDir);
+    const ctx: Ctx = { scope, root, home, env, tool: tool.name, providers };
+    const selected = PROVIDERS.filter((p) => providers.includes(p.id));
+    const ops = selected.flatMap((p) => p.plan(assets, ctx));
+    const fresh = ops.map((op) => toEntry(op, root));
+    const freshKeys = new Set(fresh.map(entryKey));
+    const stale = (old?.entries ?? []).filter((e) => !freshKeys.has(entryKey(e)));
+
+    log(`${old ? "Update" : "Install"} ${tool.name} ${tool.version} (${scope}: ${root})`);
+    fresh.forEach((e) => log(`  ${describe(e, "install")}`));
+    stale.forEach((e) => log(`  ${describe(e, "remove")}`));
+    if (fresh.some(runsCode)) log("Hooks and MCP servers run commands on this machine.");
+    if (values["dry-run"]) return 0;
+    if (ask && !(await confirm("Apply?"))) return 1;
+
+    const eng = engine(root);
+    for (const e of stale) guard(() => revert(e, eng), warnings);
+    const previous = new Map((old?.entries ?? []).map((e) => [entryKey(e), e]));
+    const recorded: Entry[] = [];
+    ops.forEach((op, i) => {
+      const prev = previous.get(entryKey(fresh[i]));
+      const kept = guard(() => apply(op, prev, eng), warnings) ?? prev;
+      if (kept) recorded.push(kept);
+    });
+    writeManifest(root, { tool: tool.name, version: tool.version, scope, providers, entries: recorded });
+    flushWarnings();
+    selected.flatMap((p) => p.notes(assets, ctx)).forEach((n) => log(`Note: ${n}`));
+    log("Done.");
+    return 0;
+  };
 
   if (command === "status") {
     const scopes = flagScope ? [flagScope] : installedScopes;
-    if (!scopes.some((s) => installedScopes.includes(s))) log(`${tool.name} is not installed.`);
-    for (const s of scopes) {
-      const m = readManifest(rootFor(s), tool.name);
-      if (m) log(statusReport(m, rootFor(s), tool.version));
+    const found = scopes.filter((s) => installedScopes.includes(s));
+    if (found.length === 0) {
+      log(`${tool.name} is not installed.`);
+      return 0;
+    }
+    const latest = await (opts.latestVersion ?? npmLatest)(packageName);
+    for (const s of found) log(statusReport(readManifest(rootFor(s), tool.name)!, rootFor(s), tool.version, latest, packageName));
+    return 0;
+  }
+
+  if (command === "update") {
+    const found = (flagScope ? [flagScope] : installedScopes).filter((s) => installedScopes.includes(s));
+    if (found.length === 0) {
+      log(`${tool.name} is not installed${flagScope ? ` (${flagScope})` : ""}: run install first.`);
+      return 1;
+    }
+    for (const s of found) {
+      const code = await installInto(s, readManifest(rootFor(s), tool.name)!.providers, false);
+      if (code !== 0) return code;
     }
     return 0;
   }
@@ -122,44 +176,36 @@ export async function runInstallerCommand(command: string, argv: string[], tool:
       ? ((await select("Install where?", scopeChoices, installedScopes[0] ?? "project")) as Scope)
       : "project";
   }
-  const root = rootFor(scope);
-  const old = readManifest(root, tool.name);
+  const old = readManifest(rootFor(scope), tool.name);
   let providers = agentsFlag ?? old?.providers ?? allIds;
   if (!agentsFlag && interactive) providers = await multiSelect("Install for which AI agents?", choices, providers);
   if (providers.length === 0) {
     log("No AI agent selected, nothing to do.");
     return 1;
   }
+  return installInto(scope, providers, interactive && !values.yes);
+}
 
-  const assets = loadAssets(tool.assetsDir);
-  const ctx: Ctx = { scope, root, home, env, tool: tool.name, providers };
-  const selected = PROVIDERS.filter((p) => providers.includes(p.id));
-  const ops = selected.flatMap((p) => p.plan(assets, ctx));
-  const fresh = ops.map((op) => toEntry(op, root));
-  const freshKeys = new Set(fresh.map(entryKey));
-  const stale = (old?.entries ?? []).filter((e) => !freshKeys.has(entryKey(e)));
+/** Asks the npm registry; offline, private or unpublished reads as "unknown", never as an error. */
+async function npmLatest(packageName: string): Promise<string | undefined> {
+  try {
+    const res = await fetch(`https://registry.npmjs.org/${packageName}/latest`, { signal: AbortSignal.timeout(3000) });
+    if (!res.ok) return undefined;
+    const { version } = (await res.json()) as { version?: unknown };
+    return typeof version === "string" ? version : undefined;
+  } catch {
+    return undefined;
+  }
+}
 
-  log(`${old ? "Update" : "Install"} ${tool.name} ${tool.version} (${scope}: ${root})`);
-  fresh.forEach((e) => log(`  ${describe(e, "install")}`));
-  stale.forEach((e) => log(`  ${describe(e, "remove")}`));
-  if (fresh.some(runsCode)) log("Hooks and MCP servers run commands on this machine.");
-  if (values["dry-run"]) return 0;
-  if (interactive && !values.yes && !(await confirm("Apply?"))) return 1;
-
-  const eng = engine(root);
-  for (const e of stale) guard(() => revert(e, eng), warnings);
-  const previous = new Map((old?.entries ?? []).map((e) => [entryKey(e), e]));
-  const recorded: Entry[] = [];
-  ops.forEach((op, i) => {
-    const prev = previous.get(entryKey(fresh[i]));
-    const kept = guard(() => apply(op, prev, eng), warnings) ?? prev;
-    if (kept) recorded.push(kept);
-  });
-  writeManifest(root, { tool: tool.name, version: tool.version, scope, providers, entries: recorded });
-  flushWarnings();
-  selected.flatMap((p) => p.notes(assets, ctx)).forEach((n) => log(`Note: ${n}`));
-  log("Done.");
-  return 0;
+/** Numeric x.y.z comparison; a pre-release tag is ignored. */
+function isNewer(a: string, b: string): boolean {
+  const pa = a.split("-")[0].split(".").map(Number);
+  const pb = b.split("-")[0].split(".").map(Number);
+  for (let i = 0; i < 3; i++) {
+    if ((pa[i] || 0) !== (pb[i] || 0)) return (pa[i] || 0) > (pb[i] || 0);
+  }
+  return false;
 }
 
 function parseAgents(list: string): string[] {
@@ -190,9 +236,10 @@ function partition<T>(list: T[], pred: (x: T) => boolean): [T[], T[]] {
   return [list.filter(pred), list.filter((x) => !pred(x))];
 }
 
-function statusReport(m: Manifest, root: string, packageVersion: string): string {
+function statusReport(m: Manifest, root: string, packageVersion: string, latest: string | undefined, packageName: string): string {
   const lines = [`${m.scope}: ${m.tool} ${m.version} for ${m.providers.join(", ")} (${root})`];
-  if (m.version !== packageVersion) lines.push(`  package is ${packageVersion}: run install to update`);
+  if (latest && isNewer(latest, m.version)) lines.push(`  npm has ${latest}: run npx ${packageName}@latest update`);
+  else if (m.version !== packageVersion) lines.push(`  package is ${packageVersion}: run update`);
   for (const e of m.entries) {
     if (e.type !== "file") continue;
     const bytes = readBytes(path.resolve(root, e.path));
