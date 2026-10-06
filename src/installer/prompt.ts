@@ -18,12 +18,13 @@ function menu(message: string, choices: Choice[], cursor0: number, checked: Set<
   };
   readline.emitKeypressEvents(process.stdin);
   process.stdin.setRawMode(true);
+  process.stdin.resume();
   render(true);
   return new Promise((resolve) => {
     const done = (out: number[]) => {
       process.stdin.removeListener("keypress", onKey);
-      process.stdin.setRawMode(false);
       process.stdin.pause();
+      process.stdin.setRawMode(false);
       resolve(out);
     };
     const onKey = (_s: string, key: { name?: string; ctrl?: boolean }) => {
