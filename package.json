@@ -1,0 +1,39 @@
+{
+  "name": "ts-ai-tool-template",
+  "version": "0.1.0",
+  "description": "Template for terminal TS AI tools: installer for Claude Code and Codex (project or global)",
+  "license": "MIT",
+  "type": "module",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/VirtualMaestro/ts-ai-tool-template.git"
+  },
+  "bin": {
+    "ts-ai-tool-template": "dist/cli.js"
+  },
+  "files": [
+    "dist/**",
+    "assets/**"
+  ],
+  "engines": {
+    "node": "^24.0.0"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "typecheck": "tsc -p tsconfig.json",
+    "test": "npm run typecheck && node --test \"test/**/*.test.ts\"",
+    "dev": "node src/cli.ts",
+    "prepublishOnly": "npm test && npm run build"
+  },
+  "keywords": [
+    "claude-code",
+    "codex",
+    "skill",
+    "ai-agent",
+    "installer"
+  ],
+  "devDependencies": {
+    "@types/node": "^24.19.1",
+    "typescript": "~5.9.0"
+  }
+}
