@@ -6,7 +6,8 @@ import type { ToolInfo } from "./installer/index.ts";
 // package.json and installs whatever is in assets/; the tool's own commands go below.
 
 const packageRoot = path.resolve(import.meta.dirname, ".."); // src/ in dev, dist/ when published
-const pkg = JSON.parse(fs.readFileSync(path.join(packageRoot, "package.json"), "utf8"));
+// npm refuses to publish without name and version.
+const pkg = JSON.parse(fs.readFileSync(path.join(packageRoot, "package.json"), "utf8")) as { name: string; version: string; description?: string };
 
 export const TOOL: ToolInfo = {
   name: pkg.name.replace(/^@[^/]+\//, ""),
@@ -15,7 +16,7 @@ export const TOOL: ToolInfo = {
   assetsDir: path.join(packageRoot, "assets"),
 };
 
-export const DESCRIPTION: string = pkg.description;
+export const DESCRIPTION: string = pkg.description ?? "";
 
 export type Command = { summary: string; run(argv: string[]): Promise<number> | number };
 

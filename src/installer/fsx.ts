@@ -6,11 +6,38 @@ export function atomicWriteFile(filePath: string, content: string | Uint8Array):
   const dir = path.dirname(filePath);
   fs.mkdirSync(dir, { recursive: true });
   const tmp = path.join(dir, `.${path.basename(filePath)}.tmp-${process.pid}-${Date.now()}`);
-  fs.writeFileSync(tmp, content);
-  // Windows cannot atomically replace an existing file; remove it first.
-  fs.rmSync(filePath, { force: true });
-  fs.renameSync(tmp, filePath);
+  fs.writeFileSync(tmp, content, { flag: "wx" });
+  try {
+    replaceFile(tmp, filePath);
+  } catch (e) {
+    fs.rmSync(tmp, { force: true });
+    throw e;
+  }
 }
+
+/** Rename from over to. If that fails, the original is still at to. */
+function replaceFile(from: string, to: string): void {
+  try {
+    fs.renameSync(from, to);
+  } catch (e) {
+    // Windows refuses to rename over a file another program holds open, but can move that file aside.
+    const aside = `${from}.old`;
+    try {
+      fs.renameSync(to, aside);
+    } catch {
+      throw e;
+    }
+    try {
+      fs.renameSync(from, to);
+    } catch (again) {
+      fs.renameSync(aside, to);
+      throw again;
+    }
+    fs.rmSync(aside, { force: true });
+  }
+}
+
+export const isObject = (v: unknown): v is Record<string, unknown> => typeof v === "object" && v !== null && !Array.isArray(v);
 
 export function sha256(content: string | Uint8Array): string {
   return createHash("sha256").update(content).digest("hex");
@@ -44,10 +71,8 @@ export function readJsonObject(filePath: string): Record<string, any> | undefine
   } catch (e) {
     throw new Error(`${filePath} is not valid JSON, refusing to modify it: ${(e as Error).message}`);
   }
-  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
-    throw new Error(`${filePath} is not a JSON object, refusing to modify it`);
-  }
-  return parsed as Record<string, any>;
+  if (!isObject(parsed)) throw new Error(`${filePath} is not a JSON object, refusing to modify it`);
+  return parsed;
 }
 
 export function writeJson(filePath: string, value: unknown): void {
@@ -99,6 +124,12 @@ export function upsertBlock(text: string, markers: [string, string], content: st
   if (range) return text.slice(0, range[0]) + block + text.slice(range[1]);
   const sep = text === "" ? "" : text.endsWith("\n\n") ? "" : text.endsWith("\n") ? "\n" : "\n\n";
   return `${text}${sep}${block}\n`;
+}
+
+/** The text between the markers, or undefined when there is no block. */
+export function blockContent(text: string, markers: [string, string]): string | undefined {
+  const range = findBlock(text, markers);
+  return range && text.slice(range[0] + markers[0].length, range[1] - markers[1].length);
 }
 
 export function removeBlock(text: string, markers: [string, string]): string {

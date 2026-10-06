@@ -32,13 +32,17 @@ It refuses to replace an install with an older version unless `--force` is given
 | `--dir <path>` | Project root (default: current directory) |
 | `-y`, `--yes` | Skip the confirmation |
 | `--dry-run` | Show the plan, change nothing |
-| `--force` | Overwrite or remove files changed since install; let `update` downgrade |
+| `--force` | Overwrite or remove files changed since install; let `update` downgrade; forget what could not be removed |
 
 ## What the installer guarantees
 
 - **Manifest.** It records everything it writes in `.ai-tools/<tool>.json`, in the project root or in the home directory.
+  - A project manifest can come with a cloned repository. It may name only paths inside the project and no commands to run; the installer refuses any other.
+  - When it cannot undo something (say `claude` is not on `PATH`), the manifest keeps it and the command exits with 1. Run it again to retry, or with `--force` to forget it.
+  - The home directory is never a project: install there with `--global`.
 - **Update.** `update`, or `install` again, brings an install to the running version and removes files the new version no longer ships.
 - **Changed files.** A file you changed after install, or one the tool did not create, is kept. Only `--force` overwrites or removes it.
+  The same holds for the text between its markers in `CLAUDE.md`, `AGENTS.md` and `config.toml`; changed line endings alone do not count.
 - **Shared config files.** In `settings.json`, `hooks.json`, `.mcp.json` and `config.toml` it adds only its own entries. `uninstall` takes exactly those out again.
   - Before it first changes one of these files, it saves a `.bak` copy.
   - A file it cannot parse is left alone.

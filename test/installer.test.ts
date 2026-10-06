@@ -4,7 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { runInstallerCommand, type RunOptions, type ToolInfo } from "../src/installer/index.ts";
-import { walkFiles } from "../src/installer/fsx.ts";
+import { sha256, walkFiles } from "../src/installer/fsx.ts";
 
 const EXAMPLES = path.resolve(import.meta.dirname, "..", "examples", "assets");
 
@@ -129,6 +129,97 @@ test("a file the user changed survives update and uninstall unless --force", asy
   assert.equal(fs.readFileSync(skill, "utf8"), read(EXAMPLES, "skills/example-skill/SKILL.md"));
 });
 
+test("a marked block the user edited survives update and uninstall unless --force", async () => {
+  const assets = copyAssets();
+  const s = sandbox(assets);
+  const config = path.join(s.project, ".codex/config.toml");
+  const claudeMd = path.join(s.project, "CLAUDE.md");
+  const mcpFile = path.join(assets, ".mcp.json");
+  await install(s);
+  fs.writeFileSync(config, read(config).replace('EXAMPLE_MODE = "demo"', 'EXAMPLE_MODE = "mine"'));
+  fs.writeFileSync(claudeMd, read(claudeMd).replace(/\n/g, "\r\n")); // an editor's line endings are no edit
+  fs.writeFileSync(mcpFile, read(mcpFile).replace('"demo"', '"new"'));
+
+  s.logs.length = 0;
+  assert.equal(await install(s), 0);
+  assert.match(read(config), /EXAMPLE_MODE = "mine"/);
+  assert.ok(s.logs.some((l) => l.startsWith("! kept .codex/config.toml (marked block): changed since install")));
+  assert.ok(!s.logs.some((l) => l.includes("kept CLAUDE.md")));
+
+  await install(s, "--force");
+  assert.match(read(config), /EXAMPLE_MODE = "new"/);
+
+  fs.writeFileSync(config, read(config).replace('"new"', '"mine"'));
+  fs.writeFileSync(claudeMd, read(claudeMd).replace(/\n/g, "\r\n"));
+  assert.equal(await uninstall(s), 0);
+  assert.match(read(config), /# >>> demo-tool >>>\n\[mcp_servers\.example-server\][^]*EXAMPLE_MODE = "mine"/);
+  assert.ok(!exists(s.project, "CLAUDE.md"));
+});
+
+test("a project manifest that reaches outside the project or runs commands is refused", async () => {
+  const s = sandbox();
+  await install(s);
+  const file = path.join(s.project, ".ai-tools/demo-tool.json");
+  const good = json(file);
+  const secret = path.join(s.home, "secret.txt");
+  fs.writeFileSync(secret, "secret");
+  const bad = [
+    { provider: "codex", type: "file", path: "../home/secret.txt", sha256: sha256("secret") },
+    { provider: "codex", type: "file", path: secret.replace(/\\/g, "/"), sha256: sha256("secret") },
+    { provider: "codex", type: "exec", label: "x", install: ["node", "-v"], uninstall: ["node", "-v"] },
+    { provider: "codex", type: "json", path: ".mcp.json", keyPath: ["__proto__", "x"], mode: "push", value: 1 },
+    { provider: "codex", type: "json", path: ".mcp.json", keyPath: [], mode: "set", value: 1 },
+  ];
+  for (const entry of bad) {
+    fs.writeFileSync(file, JSON.stringify({ ...good, entries: [...good.entries, entry] }));
+    await assert.rejects(uninstall(s, "--force"), /not a valid demo-tool manifest/);
+    await assert.rejects(runInstallerCommand("status", [], s.tool, s.opts), /not a valid demo-tool manifest/);
+  }
+  fs.writeFileSync(file, JSON.stringify({ ...good, tool: "../../escape" }));
+  await assert.rejects(uninstall(s), /not a valid demo-tool manifest/);
+  assert.equal(read(secret), "secret");
+  assert.ok(exists(s.project, ".claude/skills/example-skill/SKILL.md"));
+
+  // A "global" manifest inside a project is not this project's install: its commands never run.
+  fs.writeFileSync(file, JSON.stringify({ ...good, scope: "global", entries: [bad[2]] }));
+  assert.equal(await install(s), 0);
+  assert.deepEqual(s.ran, []);
+  assert.equal(json(file).scope, "project");
+});
+
+test("a change that cannot be undone stays in the manifest for a retry", async () => {
+  const assets = copyAssets();
+  let failing = true;
+  const s = sandbox(assets, {
+    run: (argv) => {
+      if (failing && argv[2] === "remove") throw new Error("claude: server not found");
+    },
+  });
+  const manifest = path.join(s.home, ".ai-tools/demo-tool.json");
+  const execs = () => (exists(manifest) ? json(manifest).entries.filter((e: { type: string }) => e.type === "exec").length : 0);
+  await install(s, "--global", "--agents", "claude-code");
+
+  fs.rmSync(path.join(assets, ".mcp.json"));
+  s.logs.length = 0;
+  assert.equal(await update(s), 1);
+  assert.equal(execs(), 1);
+  assert.ok(s.logs.some((l) => l.includes('! could not run "claude" (claude: server not found). Run it yourself:\n    claude mcp remove')));
+  assert.match(s.logs.at(-1)!, /Could not undo 1 change\(s\); the manifest keeps them/);
+
+  assert.equal(await uninstall(s, "--global"), 1);
+  assert.equal(execs(), 1);
+  assert.ok(!exists(s.home, ".claude/skills"), "everything else is gone");
+  assert.equal(await uninstall(s, "--global", "--force"), 0);
+  assert.ok(!exists(manifest), "--force forgets it");
+
+  fs.copyFileSync(path.join(EXAMPLES, ".mcp.json"), path.join(assets, ".mcp.json"));
+  await install(s, "--global", "--agents", "claude-code");
+  assert.equal(await uninstall(s, "--global"), 1);
+  failing = false;
+  assert.equal(await uninstall(s, "--global"), 0);
+  assert.ok(!exists(manifest), "the retry succeeds");
+});
+
 test("a file that was not installed by the tool is never overwritten without --force", async () => {
   const s = sandbox();
   const agent = path.join(s.project, ".claude/agents/example-agent.md");
@@ -227,6 +318,17 @@ test("unknown agent and conflicting scopes fail before writing", async () => {
   await assert.rejects(install(s, "--agents", "gemini"), /unknown agent "gemini"/);
   await assert.rejects(install(s, "--global", "--project"), /either --project or --global/);
   assert.deepEqual(walkFiles(s.project), []);
+});
+
+test("a project install in the home folder is refused, a global one works there", async () => {
+  const s = sandbox();
+  s.opts.cwd = s.home;
+  await assert.rejects(install(s), /is the home folder; install there with --global/);
+  assert.deepEqual(walkFiles(s.home), []);
+  assert.equal(await install(s, "--global"), 0);
+  assert.equal(await update(s), 0);
+  assert.equal(await uninstall(s), 0);
+  assert.deepEqual(walkFiles(s.home), []);
 });
 
 test("status reports version drift and changed files", async () => {

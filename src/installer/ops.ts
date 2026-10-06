@@ -2,7 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { isDeepStrictEqual } from "node:util";
 import {
-  atomicWriteFile, backupOnce, blockMarkers, pruneEmptyDirs, readBytes, readJsonObject, readText,
+  atomicWriteFile, backupOnce, blockContent, blockMarkers, isObject, pruneEmptyDirs, readBytes, readJsonObject, readText,
   removeBlock, sha256, upsertBlock, writeJson, type BlockStyle,
 } from "./fsx.ts";
 
@@ -37,12 +37,16 @@ export type Engine = {
 
 const posix = (p: string) => p.replace(/\\/g, "/");
 const relTo = (root: string, abs: string) => posix(path.relative(root, abs));
+/** Line endings do not count: an editor may convert them. */
+const blockHash = (content: string) => sha256(content.replace(/\r\n/g, "\n").trim());
+
+export const errorMessage = (e: unknown): string => (e instanceof Error ? e.message : String(e));
 
 export function toEntry(op: Op, root: string): Entry {
   switch (op.type) {
     case "file": return { provider: op.provider, type: "file", path: relTo(root, op.path), sha256: sha256(op.content) };
     case "json": return { ...op, path: relTo(root, op.path) };
-    case "block": return { provider: op.provider, type: "block", path: relTo(root, op.path), style: op.style, sha256: sha256(op.content.trim()) };
+    case "block": return { provider: op.provider, type: "block", path: relTo(root, op.path), style: op.style, sha256: blockHash(op.content) };
     case "exec": return op;
   }
 }
@@ -86,8 +90,7 @@ export function apply(op: Op, previous: Entry | undefined, eng: Engine): Entry |
     }
     case "json": {
       const obj = readJsonObject(op.path) ?? {};
-      const parent = walk(obj, op.keyPath.slice(0, -1), true)!;
-      const key = op.keyPath.at(-1)!;
+      const [parent, key] = slot(obj, op.keyPath, true)!;
       if (op.mode === "push") {
         const list = Array.isArray(parent[key]) ? parent[key] : (parent[key] = []);
         if (list.some((x: unknown) => isDeepStrictEqual(x, op.value))) return entry;
@@ -108,7 +111,13 @@ export function apply(op: Op, previous: Entry | undefined, eng: Engine): Entry |
     }
     case "block": {
       const text = readText(op.path) ?? "";
-      const next = upsertBlock(text, blockMarkers(eng.tool, op.style), op.content);
+      const markers = blockMarkers(eng.tool, op.style);
+      const current = blockContent(text, markers);
+      if (current !== undefined && editedBlock(current, previous) && blockHash(current) !== blockHash(op.content) && !eng.force) {
+        eng.warn(`kept ${rel} (marked block): changed since install (--force to overwrite)`);
+        return previous;
+      }
+      const next = upsertBlock(text, markers, op.content);
       if (next !== text) {
         if (op.style === "toml") backupOnce(op.path);
         atomicWriteFile(op.path, next);
@@ -121,18 +130,21 @@ export function apply(op: Op, previous: Entry | undefined, eng: Engine): Entry |
         eng.run(op.install);
         return entry;
       } catch (e) {
-        eng.warn(`could not run "${op.install[0]}" (${(e as Error).message.split("\n")[0]}). Run it yourself:\n    ${shellLine(op.install)}`);
+        eng.warn(`could not run "${op.install[0]}" (${errorMessage(e).split("\n")[0]}). Run it yourself:\n    ${shellLine(op.install)}`);
         return undefined;
       }
     }
   }
 }
 
-/** Undo one recorded entry. Something the user changed since install is kept unless --force. */
+/**
+ * Undo one recorded entry. Something the user changed since install is kept unless --force.
+ * Throws when the undo fails, so the caller keeps the entry for a retry.
+ */
 export function revert(e: Entry, eng: Engine): void {
   if (e.type === "exec") {
     try { eng.run(e.uninstall); } catch (err) {
-      eng.warn(`could not run "${e.uninstall[0]}" (${(err as Error).message.split("\n")[0]}). Run it yourself:\n    ${shellLine(e.uninstall)}`);
+      throw new Error(`could not run "${e.uninstall[0]}" (${errorMessage(err).split("\n")[0]}). Run it yourself:\n    ${shellLine(e.uninstall)}`, { cause: err });
     }
     return;
   }
@@ -150,16 +162,23 @@ export function revert(e: Entry, eng: Engine): void {
   if (e.type === "block") {
     const text = readText(abs);
     if (text === undefined) return;
-    const next = removeBlock(text, blockMarkers(eng.tool, e.style));
+    const markers = blockMarkers(eng.tool, e.style);
+    const current = blockContent(text, markers);
+    if (current === undefined) return;
+    if (editedBlock(current, e) && !eng.force) {
+      eng.warn(`kept ${e.path} (marked block): changed since install (--force to remove)`);
+      return;
+    }
+    const next = removeBlock(text, markers);
     if (next.trim() === "") removeFile(abs, eng.root);
-    else if (next !== text) atomicWriteFile(abs, next);
+    else atomicWriteFile(abs, next);
     return;
   }
   const obj = readJsonObject(abs);
   if (!obj) return;
-  const parent = walk(obj, e.keyPath.slice(0, -1), false);
-  const key = e.keyPath.at(-1)!;
-  if (!parent || !(key in parent)) return;
+  const target = slot(obj, e.keyPath, false);
+  if (!target || !Object.hasOwn(target[0], target[1])) return;
+  const [parent, key] = target;
   if (e.mode === "push") {
     if (!Array.isArray(parent[key])) return;
     parent[key] = parent[key].filter((x: unknown) => !isDeepStrictEqual(x, e.value));
@@ -177,6 +196,19 @@ export function revert(e: Entry, eng: Engine): void {
 function removeFile(abs: string, root: string): void {
   fs.rmSync(abs, { force: true });
   pruneEmptyDirs(path.dirname(abs), root);
+}
+
+/** The block differs from what was installed. Older manifests have no hash: their block counts as unchanged. */
+function editedBlock(current: string, e: Entry | undefined): boolean {
+  return e?.type === "block" && e.sha256 !== undefined && blockHash(current) !== e.sha256;
+}
+
+/** The object that holds the last key of keyPath, and that key. */
+function slot(obj: Record<string, any>, keyPath: string[], create: boolean): [Record<string, any>, string] | undefined {
+  const key = keyPath.at(-1);
+  if (key === undefined || keyPath.includes("__proto__")) throw new Error(`unsafe JSON key path "${keyPath.join(".")}"`);
+  const parent = walk(obj, keyPath.slice(0, -1), create);
+  return parent && [parent, key];
 }
 
 function walk(obj: Record<string, any>, keys: string[], create: boolean): Record<string, any> | undefined {
@@ -213,9 +245,57 @@ export function manifestPath(root: string, tool: string): string {
   return path.join(root, ".ai-tools", `${tool}.json`);
 }
 
-export function readManifest(root: string, tool: string): Manifest | undefined {
-  const text = readText(manifestPath(root, tool));
-  return text === undefined ? undefined : (JSON.parse(text) as Manifest);
+export function readManifest(root: string, tool: string, scope: Scope): Manifest | undefined {
+  const file = manifestPath(root, tool);
+  const text = readText(file);
+  if (text === undefined) return undefined;
+  let m: unknown;
+  try {
+    m = JSON.parse(text);
+  } catch (e) {
+    throw new Error(`${file} is not valid JSON, refusing to use it`, { cause: e });
+  }
+  // The other scope's manifest: the project is the home folder.
+  if (isObject(m) && (m.scope === "project" || m.scope === "global") && m.scope !== scope) return undefined;
+  const problem = manifestProblem(m, root, tool, scope);
+  if (problem) throw new Error(`${file} is not a valid ${tool} manifest (${problem}), refusing to use it`);
+  return m as Manifest;
+}
+
+const isStrings = (v: unknown): v is string[] => Array.isArray(v) && v.every((x) => typeof x === "string");
+
+function manifestProblem(m: unknown, root: string, tool: string, scope: Scope): string | undefined {
+  if (!isObject(m)) return "not a JSON object";
+  if (m.tool !== tool || m.scope !== scope) return `made for ${String(m.tool)} ${String(m.scope)}`;
+  if (typeof m.version !== "string" || !isStrings(m.providers) || !Array.isArray(m.entries)) return "no version, providers or entries";
+  for (const e of m.entries) {
+    const problem = entryProblem(e, root, scope);
+    if (problem) return `${problem}: ${JSON.stringify(e)}`;
+  }
+  return undefined;
+}
+
+// A project manifest can come with a cloned repository: it may name only paths inside the project,
+// and no commands. The global one is in the user's home, and CLAUDE_CONFIG_DIR may point anywhere.
+function entryProblem(e: unknown, root: string, scope: Scope): string | undefined {
+  if (!isObject(e) || typeof e.provider !== "string") return "not an entry";
+  if (e.type === "exec") {
+    if (scope === "project") return "a command in a project manifest";
+    const isCommand = (v: unknown) => isStrings(v) && v.length > 0;
+    return typeof e.label === "string" && isCommand(e.install) && isCommand(e.uninstall) ? undefined : "bad command entry";
+  }
+  if (typeof e.path !== "string" || (scope === "project" && !isInside(root, e.path))) return "path outside the project";
+  switch (e.type) {
+    case "file": return typeof e.sha256 === "string" ? undefined : "bad file entry";
+    case "block": return (e.style === "md" || e.style === "toml") && (e.sha256 === undefined || typeof e.sha256 === "string") ? undefined : "bad block entry";
+    case "json": return isStrings(e.keyPath) && e.keyPath.length > 0 && !e.keyPath.includes("__proto__") && (e.mode === "set" || e.mode === "push") ? undefined : "bad JSON entry";
+    default: return "unknown entry type";
+  }
+}
+
+function isInside(root: string, rel: string): boolean {
+  const r = path.relative(root, path.resolve(root, rel));
+  return r !== "" && !path.isAbsolute(r) && r.split(path.sep)[0] !== "..";
 }
 
 export function writeManifest(root: string, m: Manifest): void {

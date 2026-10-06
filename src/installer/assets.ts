@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { parseFrontmatter } from "./frontmatter.ts";
-import { readText, walkFiles } from "./fsx.ts";
+import { isObject, readText, walkFiles } from "./fsx.ts";
 
 // The assets folder uses the Claude Code plugin layout, so each kind lives where a plugin keeps it:
 //   skills/<name>/SKILL.md ...   agents/<name>.md   hooks/hooks.json (+ scripts)   .mcp.json
@@ -38,6 +38,15 @@ function readFiles(dir: string): AssetFile[] {
   });
 }
 
+/** `key` of a JSON asset file: an object whose every value passes `valid`, or undefined when absent. */
+function objectOf(file: string, text: string, key: string, valid: (v: unknown) => boolean, expected: string): Record<string, unknown> | undefined {
+  const doc: unknown = JSON.parse(text);
+  const value = isObject(doc) ? doc[key] : doc;
+  if (value === undefined) return undefined;
+  if (isObject(value) && Object.values(value).every(valid)) return value;
+  throw new Error(`${file}: "${key}" must map ${expected}`);
+}
+
 function subdirs(dir: string): string[] {
   if (!fs.existsSync(dir)) return [];
   return fs.readdirSync(dir, { withFileTypes: true }).filter((e) => e.isDirectory()).map((e) => e.name).sort();
@@ -62,14 +71,19 @@ export function loadAssets(assetsDir: string): Assets {
     });
 
   const hooksDir = path.join(assetsDir, "hooks");
-  const hooksText = readText(path.join(hooksDir, "hooks.json"));
+  const hooksFile = path.join(hooksDir, "hooks.json");
+  const hooksText = readText(hooksFile);
+  const isGroups = (v: unknown) => Array.isArray(v) && v.every(isObject);
   const hooks = hooksText === undefined ? undefined : {
-    events: (JSON.parse(hooksText).hooks ?? {}) as Record<string, HookGroup[]>,
+    events: (objectOf(hooksFile, hooksText, "hooks", isGroups, "each event to an array of hook groups") ?? {}) as Record<string, HookGroup[]>,
     files: readFiles(hooksDir).filter((f) => f.rel !== "hooks.json"),
   };
 
-  const mcpText = readText(path.join(assetsDir, ".mcp.json"));
-  const mcpServers = mcpText === undefined ? undefined : (JSON.parse(mcpText).mcpServers as Record<string, McpServer>);
+  const mcpFile = path.join(assetsDir, ".mcp.json");
+  const mcpText = readText(mcpFile);
+  const mcpServers = mcpText === undefined
+    ? undefined
+    : (objectOf(mcpFile, mcpText, "mcpServers", isObject, "each name to a server object") as Record<string, McpServer> | undefined);
   for (const name of Object.keys(mcpServers ?? {})) safeName(name, ".mcp.json");
 
   const instructions = readText(path.join(assetsDir, "instructions.md"))?.trim() || undefined;

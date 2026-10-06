@@ -5,8 +5,9 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { promisify } from "node:util";
+import { loadAssets } from "../src/installer/assets.ts";
 import { parseFrontmatter } from "../src/installer/frontmatter.ts";
-import { blockMarkers, removeBlock, upsertBlock } from "../src/installer/fsx.ts";
+import { atomicWriteFile, blockMarkers, removeBlock, upsertBlock } from "../src/installer/fsx.ts";
 import { agentToml, codexMcpServer } from "../src/installer/providers.ts";
 import { tomlString, tomlTable } from "../src/installer/toml.ts";
 
@@ -52,19 +53,53 @@ test("marked blocks round-trip without touching the rest", () => {
   }
 });
 
+test("atomicWriteFile keeps the original when the new file cannot take its place", (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "ai-tool-atomic-"));
+  const file = path.join(dir, "settings.json");
+  fs.writeFileSync(file, "original");
+  const rename = fs.renameSync;
+  let refuse = (_from: string, to: string) => fs.existsSync(to); // Windows, with the file held open
+  t.mock.method(fs, "renameSync", (from: fs.PathLike, to: fs.PathLike) => {
+    if (refuse(String(from), String(to))) throw Object.assign(new Error("EPERM: rename refused"), { code: "EPERM" });
+    rename(from, to);
+  });
+
+  atomicWriteFile(file, "new");
+  assert.equal(fs.readFileSync(file, "utf8"), "new");
+  assert.deepEqual(fs.readdirSync(dir), ["settings.json"]);
+
+  refuse = (from) => /\.tmp-\d+-\d+$/.test(from);
+  assert.throws(() => atomicWriteFile(file, "newer"), /rename refused/);
+  assert.equal(fs.readFileSync(file, "utf8"), "new");
+  assert.deepEqual(fs.readdirSync(dir), ["settings.json"]);
+});
+
+test("loadAssets rejects hooks.json and .mcp.json of the wrong shape", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "ai-tool-assets-"));
+  fs.mkdirSync(path.join(dir, "hooks"));
+  fs.writeFileSync(path.join(dir, "hooks/hooks.json"), JSON.stringify({ hooks: { SessionStart: { hooks: [] } } }));
+  assert.throws(() => loadAssets(dir), /"hooks" must map each event to an array of hook groups/);
+  fs.rmSync(path.join(dir, "hooks"), { recursive: true });
+  fs.writeFileSync(path.join(dir, ".mcp.json"), JSON.stringify({ mcpServers: { x: "npx x" } }));
+  assert.throws(() => loadAssets(dir), /"mcpServers" must map each name to a server object/);
+  fs.writeFileSync(path.join(dir, ".mcp.json"), "[]");
+  assert.throws(() => loadAssets(dir), /"mcpServers" must map/);
+});
+
 test("cli: --help and a non-interactive install of the real assets", async () => {
-  const run = promisify(execFile);
+  const exec = promisify(execFile);
   const cli = path.resolve(import.meta.dirname, "..", "src", "cli.ts");
-  const help = await run(process.execPath, [cli, "--help"]);
+  const run = (args: string[], env?: NodeJS.ProcessEnv) => exec(process.execPath, [cli, ...args], { env, timeout: 30_000 });
+  const help = await run(["--help"]);
   assert.match(help.stdout, /install\s+Install or update/);
 
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "ai-tool-cli-"));
-  const env = { ...process.env, HOME: dir, USERPROFILE: dir };
-  const res = await run(process.execPath, [cli, "install", "--dir", dir], { env });
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "ai-tool-cli-home-"));
+  const res = await run(["install", "--dir", dir], { ...process.env, HOME: home, USERPROFILE: home });
   assert.match(res.stdout, /Done\./);
   const pkg = JSON.parse(fs.readFileSync(path.resolve(import.meta.dirname, "..", "package.json"), "utf8"));
   assert.ok(fs.existsSync(path.join(dir, ".ai-tools", `${pkg.name}.json`)));
 
-  const bad = await run(process.execPath, [cli, "nope"]).catch((e) => e);
+  const bad = await run(["nope"]).catch((e) => e);
   assert.equal(bad.code, 1);
 });

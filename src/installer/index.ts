@@ -5,7 +5,7 @@ import { isDeepStrictEqual, parseArgs } from "node:util";
 import { loadAssets } from "./assets.ts";
 import { readBytes, sha256 } from "./fsx.ts";
 import {
-  apply, describe, entryKey, readManifest, revert, toEntry, writeManifest,
+  apply, describe, entryKey, errorMessage, readManifest, revert, toEntry, writeManifest,
   type Engine, type Entry, type Manifest, type Scope,
 } from "./ops.ts";
 import { confirm, multiSelect, select } from "./prompt.ts";
@@ -46,7 +46,8 @@ Options:
   --dir <path>       Project root (default: current directory)
   -y, --yes          Do not ask for confirmation
   --dry-run          Print the plan, change nothing
-  --force            Overwrite or remove files changed since install; let update downgrade`;
+  --force            Overwrite or remove files changed since install; let update downgrade;
+                     forget what could not be removed`;
 
 export async function runInstallerCommand(command: string, argv: string[], tool: ToolInfo, opts: RunOptions = {}): Promise<number> {
   const { values } = parseArgs({
@@ -71,7 +72,7 @@ export async function runInstallerCommand(command: string, argv: string[], tool:
   const run = opts.run ?? ((a: string[]) => void execFileSync(a[0], a.slice(1), { stdio: "pipe", env }));
   const rootFor = (s: Scope) => (s === "global" ? home : cwd);
   const flagScope: Scope | undefined = values.global ? "global" : values.project ? "project" : undefined;
-  const installedScopes = (["project", "global"] as Scope[]).filter((s) => readManifest(rootFor(s), tool.name));
+  const installedScopes = (["project", "global"] as Scope[]).filter((s) => readManifest(rootFor(s), tool.name, s));
   const agentsFlag = values.agents === undefined ? undefined : parseAgents(values.agents);
   const allIds = PROVIDERS.map((p) => p.id);
   const choices = PROVIDERS.map((p) => ({ label: p.label, value: p.id }));
@@ -87,12 +88,32 @@ export async function runInstallerCommand(command: string, argv: string[], tool:
   const flushWarnings = () => warnings.splice(0).forEach((w) => log(`! ${w}`));
   const packageName = tool.packageName ?? tool.name;
 
+  /** Undo entries. Returns the ones that failed: the manifest keeps them for the next run, unless --force. */
+  const revertAll = (entries: Entry[], eng: Engine): Entry[] =>
+    entries.filter((e) => {
+      try {
+        revert(e, eng);
+        return false;
+      } catch (err) {
+        warnings.push(errorMessage(err));
+        return !values.force;
+      }
+    });
+  const done = (leftover: Entry[]): number => {
+    if (leftover.length === 0) {
+      log("Done.");
+      return 0;
+    }
+    log(`Could not undo ${leftover.length} change(s); the manifest keeps them. Run again to retry, or with --force to forget them.`);
+    return 1;
+  };
+
   const ask = opts.confirm ?? confirm;
 
   /** "always": confirm every change (install). "new-code": only new or changed hooks and MCP servers (update). */
   const installInto = async (scope: Scope, providers: string[], confirmWhen: "always" | "new-code"): Promise<number> => {
     const root = rootFor(scope);
-    const old = readManifest(root, tool.name);
+    const old = readManifest(root, tool.name, scope);
     const assets = loadAssets(tool.assetsDir);
     const ctx: Ctx = { scope, root, home, env, tool: tool.name, providers };
     const selected = PROVIDERS.filter((p) => providers.includes(p.id));
@@ -116,18 +137,17 @@ export async function runInstallerCommand(command: string, argv: string[], tool:
     if (interactive && !values.yes && confirmNeeded && !(await ask("Apply?"))) return 1;
 
     const eng = engine(root);
-    for (const e of stale) guard(() => revert(e, eng), warnings);
+    const leftover = revertAll(stale, eng);
     const recorded: Entry[] = [];
     ops.forEach((op, i) => {
       const prev = previous.get(entryKey(fresh[i]));
       const kept = guard(() => apply(op, prev, eng), warnings) ?? prev;
       if (kept) recorded.push(kept);
     });
-    writeManifest(root, { tool: tool.name, version: tool.version, scope, providers, entries: recorded });
+    writeManifest(root, { tool: tool.name, version: tool.version, scope, providers, entries: [...recorded, ...leftover] });
     flushWarnings();
     selected.flatMap((p) => p.notes(assets, ctx)).forEach((n) => log(`Note: ${n}`));
-    log("Done.");
-    return 0;
+    return done(leftover);
   };
 
   if (command === "status") {
@@ -138,7 +158,7 @@ export async function runInstallerCommand(command: string, argv: string[], tool:
       return 0;
     }
     const latest = await (opts.latestVersion ?? npmLatest)(packageName);
-    for (const s of found) log(statusReport(readManifest(rootFor(s), tool.name)!, rootFor(s), tool.version, latest, packageName));
+    for (const s of found) log(statusReport(readManifest(rootFor(s), tool.name, s)!, rootFor(s), tool.version, latest, packageName));
     return 0;
   }
 
@@ -150,14 +170,14 @@ export async function runInstallerCommand(command: string, argv: string[], tool:
       return 1;
     }
     // A cached `npx <tool>` can be older than what is installed; updating from it would downgrade.
-    const newer = found.map((s) => readManifest(rootFor(s), tool.name)!).filter((m) => isNewer(m.version, tool.version));
+    const newer = found.map((s) => readManifest(rootFor(s), tool.name, s)!).filter((m) => isNewer(m.version, tool.version));
     if (newer.length && !values.force) {
       newer.forEach((m) => log(`${m.scope}: installed ${m.version} is newer than this copy (${tool.version}).`));
       log(`Run npx ${packageName}@latest update, or --force to downgrade.`);
       return 1;
     }
     for (const s of found) {
-      const code = await installInto(s, readManifest(rootFor(s), tool.name)!.providers, "new-code");
+      const code = await installInto(s, readManifest(rootFor(s), tool.name, s)!.providers, "new-code");
       if (code !== 0) return code;
     }
     return 0;
@@ -169,23 +189,22 @@ export async function runInstallerCommand(command: string, argv: string[], tool:
       scope = (await select("Uninstall from where?", scopeChoices, "project")) as Scope;
     }
     const root = scope && rootFor(scope);
-    const m = root && readManifest(root, tool.name);
+    const m = root && readManifest(root, tool.name, scope);
     if (!m) {
       log(`${tool.name} is not installed${scope ? ` (${scope})` : ""}.`);
       return 0;
     }
     const remove = agentsFlag ?? m.providers;
-    const [gone, kept] = partition(m.entries, (e) => remove.includes(e.provider));
+    // Without --agents everything goes, also what an earlier run could not undo.
+    const [gone, kept] = partition(m.entries, (e) => !agentsFlag || remove.includes(e.provider));
     log(`Uninstall ${tool.name} (${scope}: ${root})`);
     gone.forEach((e) => log(`  ${describe(e, "remove")}`));
     if (values["dry-run"]) return 0;
     if (interactive && !values.yes && !(await ask("Remove these?"))) return 1;
-    const eng = engine(root);
-    for (const e of gone) guard(() => revert(e, eng), warnings);
-    writeManifest(root, { ...m, providers: m.providers.filter((p) => !remove.includes(p)), entries: kept });
+    const leftover = revertAll(gone, engine(root));
+    writeManifest(root, { ...m, providers: m.providers.filter((p) => !remove.includes(p)), entries: [...kept, ...leftover] });
     flushWarnings();
-    log("Done.");
-    return 0;
+    return done(leftover);
   }
 
   // install / update
@@ -195,8 +214,11 @@ export async function runInstallerCommand(command: string, argv: string[], tool:
       ? ((await select("Install where?", scopeChoices, installedScopes[0] ?? "project")) as Scope)
       : "project";
   }
-  const old = readManifest(rootFor(scope), tool.name);
-  let providers = agentsFlag ?? old?.providers ?? allIds;
+  // Both scopes would share one manifest, and the project paths are mostly the global ones.
+  if (scope === "project" && cwd === home) throw new Error(`${cwd} is the home folder; install there with --global`);
+  const old = readManifest(rootFor(scope), tool.name, scope);
+  // An uninstall that could not undo everything leaves a manifest without providers.
+  let providers = agentsFlag ?? (old?.providers.length ? old.providers : allIds);
   if (!agentsFlag && interactive) providers = await multiSelect("Install for which AI agents?", choices, providers);
   if (providers.length === 0) {
     log("No AI agent selected, nothing to do.");
@@ -246,7 +268,7 @@ function guard<T>(fn: () => T, warnings: string[]): T | undefined {
   try {
     return fn();
   } catch (e) {
-    warnings.push((e as Error).message);
+    warnings.push(errorMessage(e));
     return undefined;
   }
 }
